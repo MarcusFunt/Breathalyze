@@ -225,20 +225,30 @@ void loop() {
   // ----- Read pressure & update baseline -----
   static bool announcedNoPress = false;
   if (bmpOK) {
-    float pPa = bmp.readPressure();                 // Pascals
-    if (isnan(baselinePa)) baselinePa = pPa;        // initialize
-
-    baselinePa = baselinePa + lpAlpha * (pPa - baselinePa);  // EMA
-    float deltaHPA = (pPa - baselinePa) / 100.0f;            // hPa
-    lastDeltaHPA = deltaHPA;
-
-    // Show live pressure delta (helps tune threshold)
     static uint32_t lastPressureReport = 0;
-    if (now - lastPressureReport >= 500) { // limit to 2 Hz
-      gbSendLog(String("PRESS ") + String(deltaHPA, 2) + " hPa");
-      lastPressureReport = now;
+    static uint32_t lastInvalidPressureLog = 0;
+
+    float pPa = bmp.readPressure();                 // Pascals
+    if (isnan(pPa)) {
+      if (!announcedNoPress || (now - lastInvalidPressureLog >= 1000)) {
+        gbSendLog("PRESS --");
+        lastInvalidPressureLog = now;
+        announcedNoPress = true;
+      }
+    } else {
+      if (isnan(baselinePa)) baselinePa = pPa;        // initialize
+
+      baselinePa = baselinePa + lpAlpha * (pPa - baselinePa);  // EMA
+      float deltaHPA = (pPa - baselinePa) / 100.0f;            // hPa
+      lastDeltaHPA = deltaHPA;
+
+      // Show live pressure delta (helps tune threshold)
+      if (now - lastPressureReport >= 500) { // limit to 2 Hz
+        gbSendLog(String("PRESS ") + String(deltaHPA, 2) + " hPa");
+        lastPressureReport = now;
+      }
+      announcedNoPress = false;
     }
-    announcedNoPress = false;
   } else {
     if (!announcedNoPress) {
       gbSendLog("PRESS --");
