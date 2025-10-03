@@ -61,6 +61,7 @@ void gbSendStatus(const String &msg);
 void gbSendLog(const String &msg);
 void gbSendResult(int peakRaw, float peakVoltage);
 void gbSendInitialBurst();
+String gbCurrentStatusMessage();
 
 // BLE UUIDs used by Gadgetbridge/Bangle.js Nordic UART service
 static const NimBLEUUID GB_SERVICE_UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
@@ -71,6 +72,7 @@ class GBServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server) override {
     gbConnected = true;
     gbNotifyEnabled = false;
+    gbSendStatus(gbCurrentStatusMessage());
   }
   void onDisconnect(NimBLEServer* server) override {
     gbConnected = false;
@@ -150,6 +152,26 @@ void gbSendJSON(const String &json) {
   }
 }
 
+String gbCurrentStatusMessage() {
+  switch (mode) {
+    case IDLE:
+      return String("READY");
+    case SAMPLING:
+      return String("SAMPLING");
+    case REFRACTORY:
+      return String("RESULT");
+    case WARMING: {
+      uint32_t now = millis();
+      uint32_t elapsed = now - modeTS;
+      uint32_t remainS = (elapsed >= QUICK_HEAT_MS)
+                             ? 0
+                             : (QUICK_HEAT_MS - elapsed + 999) / 1000;
+      return String("WARMING ") + remainS + "s";
+    }
+  }
+  return String("READY");
+}
+
 void gbSendStatus(const String &msg) {
   String json = String("{\"t\":\"status\",\"src\":\"Breathalyze\",\"msg\":\"") +
                 gbEscape(msg) + "\"}";
@@ -170,7 +192,7 @@ void gbSendResult(int peakRaw, float peakVoltage) {
 }
 
 void gbSendInitialBurst() {
-  gbSendStatus("READY");
+  gbSendStatus(gbCurrentStatusMessage());
   if (bmpOK && !isnan(baselinePa)) {
     gbSendLog(String("PRESS ") + String(lastDeltaHPA, 2) + " hPa");
   } else {
