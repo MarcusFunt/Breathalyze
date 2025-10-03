@@ -14,6 +14,7 @@
 #include <NimBLEDevice.h>
 #include <stdio.h>
 #include <math.h>
+#include <algorithm>
 
 // ===== Pins: Seeed XIAO ESP32S3 =====
 #define I2C_SDA        5    // D4
@@ -40,10 +41,13 @@ bool bmpOK = false;
 // ===== Gadgetbridge BLE (Nordic UART Service compatible) =====
 static NimBLECharacteristic* gbTxCharacteristic = nullptr;
 static bool gbConnected = false;
+static bool gbNotifyEnabled = false;
+static uint16_t gbNotifyMax = 20;
 
 void gbSendStatus(const String &msg);
 void gbSendLog(const String &msg);
 void gbSendResult(int peakRaw, float peakVoltage);
+void gbSendInitialBurst();
 
 // BLE UUIDs used by Gadgetbridge/Bangle.js Nordic UART service
 static const NimBLEUUID GB_SERVICE_UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
@@ -53,19 +57,17 @@ static const NimBLEUUID GB_CHAR_UUID_TX("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
 class GBServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server) override {
     gbConnected = true;
-    gbSendStatus("READY");
-    if (bmpOK && !isnan(baselinePa)) {
-      gbSendLog(String("PRESS ") + String(lastDeltaHPA, 2) + " hPa");
-    } else {
-      gbSendLog("PRESS --");
-    }
-    float v = (alcRaw / 4095.0f) * 3.3f;
-    gbSendLog(String("ALC ") + alcRaw + " (" + String(v, 2) + " V)");
-    gbSendLog(String("PEAK ") + alcPeak);
+    gbNotifyEnabled = false;
   }
   void onDisconnect(NimBLEServer* server) override {
     gbConnected = false;
+    gbNotifyEnabled = false;
     NimBLEDevice::startAdvertising();
+  }
+  void onMTUChange(uint16_t MTU, ble_gap_conn_desc* desc) override {
+    int adjusted = static_cast<int>(MTU) - 3;
+    if (adjusted < 20) adjusted = 20;
+    gbNotifyMax = static_cast<uint16_t>(adjusted);
   }
 };
 
@@ -75,6 +77,18 @@ class GBRxCallbacks : public NimBLECharacteristicCallbacks {
     // currently act on them, but reading and ignoring prevents warnings.
     std::string value = characteristic->getValue();
     (void)value;
+  }
+};
+
+class GBTxCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic* characteristic,
+                   ble_gap_conn_desc* desc,
+                   uint16_t subValue) override {
+    bool enabled = (subValue & 0x0001);
+    gbNotifyEnabled = enabled;
+    if (enabled) {
+      gbSendInitialBurst();
+    }
   }
 };
 
@@ -104,11 +118,23 @@ String gbEscape(const String &input) {
 }
 
 void gbSendJSON(const String &json) {
-  if (!gbConnected || gbTxCharacteristic == nullptr) return;
+  if (!gbConnected || gbTxCharacteristic == nullptr || !gbNotifyEnabled) return;
   String payload = "GB(" + json + ")\n";
-  gbTxCharacteristic->setValue(payload.c_str());
-  gbTxCharacteristic->notify();
-  delay(5);  // allow stack to flush before next packet
+  const char* data = payload.c_str();
+  size_t totalLen = payload.length();
+  for (size_t offset = 0; offset < totalLen; offset += gbNotifyMax) {
+    size_t chunkLen = std::min<size_t>(gbNotifyMax, totalLen - offset);
+    if (!gbTxCharacteristic->setValue(reinterpret_cast<const uint8_t*>(data + offset),
+                                      chunkLen)) {
+      Serial.println("GB notify setValue failed");
+      return;
+    }
+    if (!gbTxCharacteristic->notify()) {
+      Serial.println("GB notify failed");
+      return;
+    }
+    delay(5);  // allow stack to flush before next packet
+  }
 }
 
 void gbSendStatus(const String &msg) {
@@ -128,6 +154,18 @@ void gbSendResult(int peakRaw, float peakVoltage) {
   String json = String("{\"t\":\"notify\",\"id\":1,\"src\":\"Breathalyze\",\"title\":\"Breathalyzer\",\"body\":\"") +
                 gbEscape(body) + "\"}";
   gbSendJSON(json);
+}
+
+void gbSendInitialBurst() {
+  gbSendStatus("READY");
+  if (bmpOK && !isnan(baselinePa)) {
+    gbSendLog(String("PRESS ") + String(lastDeltaHPA, 2) + " hPa");
+  } else {
+    gbSendLog("PRESS --");
+  }
+  float v = (alcRaw / 4095.0f) * 3.3f;
+  gbSendLog(String("ALC ") + alcRaw + " (" + String(v, 2) + " V)");
+  gbSendLog(String("PEAK ") + alcPeak);
 }
 
 // ===== State machine =====
@@ -179,6 +217,7 @@ void setup() {
       GB_CHAR_UUID_TX,
       NIMBLE_PROPERTY::NOTIFY
   );
+  gbTxCharacteristic->setCallbacks(new GBTxCallbacks());
   NimBLECharacteristic* rxCharacteristic = service->createCharacteristic(
       GB_CHAR_UUID_RX,
       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
