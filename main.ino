@@ -56,6 +56,7 @@ uint32_t modeTS = 0;
 
 int   alcRaw  = 0, alcPeak = 0;
 float lastDeltaHPA = 0.0f;
+bool lastPressureValid = false;
 
 void gbSendStatus(const String &msg);
 void gbSendLog(const String &msg);
@@ -292,12 +293,15 @@ void loop() {
     static uint32_t lastInvalidPressureLog = 0;
 
     float pPa = bmp.readPressure();                 // Pascals
-    if (isnan(pPa)) {
+    bool pressureValid = !isnan(pPa);
+    if (!pressureValid) {
       if (!announcedNoPress || (now - lastInvalidPressureLog >= 1000)) {
         gbSendLog("PRESS --");
         lastInvalidPressureLog = now;
         announcedNoPress = true;
       }
+      lastDeltaHPA = 0.0f;
+      trigHoldMS = 0;
     } else {
       if (isnan(baselinePa)) baselinePa = pPa;        // initialize
 
@@ -312,11 +316,15 @@ void loop() {
       }
       announcedNoPress = false;
     }
+    lastPressureValid = pressureValid;
   } else {
     if (!announcedNoPress) {
       gbSendLog("PRESS --");
       announcedNoPress = true;
     }
+    lastDeltaHPA = 0.0f;
+    trigHoldMS = 0;
+    lastPressureValid = false;
   }
 
   // ----- State machine -----
@@ -324,6 +332,10 @@ void loop() {
     case IDLE: {
       if (!HEATER_ALWAYS_ON) digitalWrite(ALC_SEL_PIN, HIGH); // heater OFF
       if (bmpOK) {
+        if (!lastPressureValid) {
+          trigHoldMS = 0;
+          break;
+        }
         // Require breath threshold for TRIG_SUSTAIN_MS
         if (lastDeltaHPA > TRIG_DELTA_HPA) {
           trigHoldMS += (uint16_t)(1000.0f / SAMPLE_HZ);
