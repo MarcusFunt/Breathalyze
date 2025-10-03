@@ -1,5 +1,5 @@
 /*
-  XIAO ESP32S3 + BMP280 (breath trigger) + MQ303A (alcohol) -> DashIO over BLE
+  XIAO ESP32S3 + BMP280 (breath trigger) + MQ303A (alcohol) -> Gadgetbridge over BLE
   Wiring (XIAO pin -> function):
     D4 / GPIO5  -> I2C SDA (BMP280)
     D5 / GPIO6  -> I2C SCL (BMP280)
@@ -7,13 +7,13 @@
     D6 / GPIO43 -> MQ303A heater enable (LOW = HEAT ON per your schematic)
     3V3         -> MQ303A board VCC
     GND         -> MQ303A GND and BMP280 GND
-
-  DashIO UI: add 4 Text Boxes with IDs STAT, PRESS, ALC, PEAK (or import your own layout)
 */
 
 #include <Wire.h>
 #include <Adafruit_BMP280.h>
-#include "DashioESP.h"   // DashIoT/DashioESP
+#include <NimBLEDevice.h>
+#include <stdio.h>
+#include <math.h>
 
 // ===== Pins: Seeed XIAO ESP32S3 =====
 #define I2C_SDA        5    // D4
@@ -37,18 +37,97 @@ static const uint32_t QUICK_HEAT_MS      = 10000;   // warmup time if not always
 Adafruit_BMP280 bmp;
 bool bmpOK = false;
 
-// ===== DashIO BLE =====
-DashDevice dashDevice("XIAO_ESP32S3");
-DashBLE    ble_con(&dashDevice, true);
+// ===== Gadgetbridge BLE (Nordic UART Service compatible) =====
+static NimBLECharacteristic* gbTxCharacteristic = nullptr;
+static bool gbConnected = false;
 
-// Helpers to send text box updates (batch into one BLE message)
-void sendText(const char* id, const String &txt) {
-  static String buf;
-  buf += dashDevice.getTextBoxMessage(id, txt);
-  if (id == nullptr || buf.length() > 400) {
-    ble_con.sendMessage(buf);
-    buf = "";
+void gbSendStatus(const String &msg);
+void gbSendLog(const String &msg);
+void gbSendResult(int peakRaw, float peakVoltage);
+
+// BLE UUIDs used by Gadgetbridge/Bangle.js Nordic UART service
+static const NimBLEUUID GB_SERVICE_UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+static const NimBLEUUID GB_CHAR_UUID_RX("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+static const NimBLEUUID GB_CHAR_UUID_TX("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+
+class GBServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* server) override {
+    gbConnected = true;
+    gbSendStatus("READY");
+    if (bmpOK && !isnan(baselinePa)) {
+      gbSendLog(String("PRESS ") + String(lastDeltaHPA, 2) + " hPa");
+    } else {
+      gbSendLog("PRESS --");
+    }
+    float v = (alcRaw / 4095.0f) * 3.3f;
+    gbSendLog(String("ALC ") + alcRaw + " (" + String(v, 2) + " V)");
+    gbSendLog(String("PEAK ") + alcPeak);
   }
+  void onDisconnect(NimBLEServer* server) override {
+    gbConnected = false;
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+class GBRxCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* characteristic) override {
+    // Gadgetbridge may send "v" (version) or other commands. We do not
+    // currently act on them, but reading and ignoring prevents warnings.
+    std::string value = characteristic->getValue();
+    (void)value;
+  }
+};
+
+String gbEscape(const String &input) {
+  String out;
+  out.reserve(input.length() + 8);
+  for (size_t i = 0; i < input.length(); ++i) {
+    char c = input[i];
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '\"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (static_cast<uint8_t>(c) < 0x20) {
+          char buf[7];
+          snprintf(buf, sizeof(buf), "\\u%04x", c & 0xFF);
+          out += buf;
+        } else {
+          out += c;
+        }
+        break;
+    }
+  }
+  return out;
+}
+
+void gbSendJSON(const String &json) {
+  if (!gbConnected || gbTxCharacteristic == nullptr) return;
+  String payload = "GB(" + json + ")\n";
+  gbTxCharacteristic->setValue(payload.c_str());
+  gbTxCharacteristic->notify();
+  delay(5);  // allow stack to flush before next packet
+}
+
+void gbSendStatus(const String &msg) {
+  String json = String("{\"t\":\"status\",\"src\":\"Breathalyze\",\"msg\":\"") +
+                gbEscape(msg) + "\"}";
+  gbSendJSON(json);
+}
+
+void gbSendLog(const String &msg) {
+  String json = String("{\"t\":\"log\",\"src\":\"Breathalyze\",\"msg\":\"") +
+                gbEscape(msg) + "\"}";
+  gbSendJSON(json);
+}
+
+void gbSendResult(int peakRaw, float peakVoltage) {
+  String body = String("Peak: ") + peakRaw + " (" + String(peakVoltage, 2) + " V)";
+  String json = String("{\"t\":\"notify\",\"id\":1,\"src\":\"Breathalyze\",\"title\":\"Breathalyzer\",\"body\":\"") +
+                gbEscape(body) + "\"}";
+  gbSendJSON(json);
 }
 
 // ===== State machine =====
@@ -89,15 +168,37 @@ void setup() {
   analogReadResolution(12);                         // 0..4095
   analogSetPinAttenuation(ALC_DAT_PIN, ADC_11db);   // ~3.3 V FS
 
-  // --- DashIO BLE ---
-  ble_con.begin();  // starts advertising
+  // --- Gadgetbridge BLE ---
+  NimBLEDevice::init("Breathalyze");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P7);
+  NimBLEServer* server = NimBLEDevice::createServer();
+  server->setCallbacks(new GBServerCallbacks());
+
+  NimBLEService* service = server->createService(GB_SERVICE_UUID);
+  gbTxCharacteristic = service->createCharacteristic(
+      GB_CHAR_UUID_TX,
+      NIMBLE_PROPERTY::NOTIFY
+  );
+  NimBLECharacteristic* rxCharacteristic = service->createCharacteristic(
+      GB_CHAR_UUID_RX,
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+  );
+  rxCharacteristic->setCallbacks(new GBRxCallbacks());
+
+  service->start();
+
+  NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
+  advertising->addServiceUUID(GB_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->setMinInterval(100);
+  advertising->setMaxInterval(200);
+  NimBLEDevice::startAdvertising();
 
   // Prime UI
-  sendText("STAT",  "READY");
-  sendText("PRESS", "--");
-  sendText("ALC",   "--");
-  sendText("PEAK",  "--");
-  sendText(nullptr, ""); // flush
+  gbSendStatus("READY");
+  gbSendLog("PRESS --");
+  gbSendLog("ALC --");
+  gbSendLog("PEAK --");
 
   // EMA coefficient for baseline tracking
   float dt = 1.0f / SAMPLE_HZ;
@@ -110,12 +211,11 @@ void beginSamplingWindow() {
   mode = SAMPLING;
   modeTS = millis();
   alcPeak = 0;
-  sendText("STAT", "SAMPLING");
-  sendText(nullptr, "");
+  gbSendStatus("SAMPLING");
 }
 
 void loop() {
-  ble_con.run(); // keep BLE happy
+  // no dedicated BLE service loop required for NimBLE-Arduino
 
   // --- fixed-rate sampling (BMP280 + logic) ---
   uint32_t now = millis();
@@ -123,6 +223,7 @@ void loop() {
   lastSampleMS = now;
 
   // ----- Read pressure & update baseline -----
+  static bool announcedNoPress = false;
   if (bmpOK) {
     float pPa = bmp.readPressure();                 // Pascals
     if (isnan(baselinePa)) baselinePa = pPa;        // initialize
@@ -132,9 +233,17 @@ void loop() {
     lastDeltaHPA = deltaHPA;
 
     // Show live pressure delta (helps tune threshold)
-    sendText("PRESS", String(deltaHPA, 2) + " hPa");
+    static uint32_t lastPressureReport = 0;
+    if (now - lastPressureReport >= 500) { // limit to 2 Hz
+      gbSendLog(String("PRESS ") + String(deltaHPA, 2) + " hPa");
+      lastPressureReport = now;
+    }
+    announcedNoPress = false;
   } else {
-    sendText("PRESS", "--");
+    if (!announcedNoPress) {
+      gbSendLog("PRESS --");
+      announcedNoPress = true;
+    }
   }
 
   // ----- State machine -----
@@ -150,8 +259,7 @@ void loop() {
               digitalWrite(ALC_SEL_PIN, LOW); // heater ON
               mode = WARMING;
               modeTS = now;
-              sendText("STAT", "WARMING...");
-              sendText(nullptr, "");
+              gbSendStatus("WARMING...");
             } else {
               beginSamplingWindow();
             }
@@ -169,8 +277,7 @@ void loop() {
       uint32_t remainS = (elapsed >= QUICK_HEAT_MS) ? 0 : (QUICK_HEAT_MS - elapsed + 999) / 1000;
       static uint32_t lastAnnounce = 0;
       if (now - lastAnnounce > 500) {
-        sendText("STAT", String("WARMING ") + remainS + "s");
-        sendText(nullptr, "");
+        gbSendStatus(String("WARMING ") + remainS + "s");
         lastAnnounce = now;
       }
       if (elapsed >= QUICK_HEAT_MS) beginSamplingWindow();
@@ -184,13 +291,17 @@ void loop() {
       if (raw > alcPeak) alcPeak = raw;
 
       float v = (raw / 4095.0f) * 3.3f;
-      sendText("ALC", String(raw) + " (" + String(v, 2) + " V)");
-      sendText(nullptr, "");
+      static uint32_t lastAlcReport = 0;
+      if (now - lastAlcReport >= 250) { // 4 Hz updates while sampling
+        gbSendLog(String("ALC ") + raw + " (" + String(v, 2) + " V)");
+        lastAlcReport = now;
+      }
 
       if (now - modeTS >= SAMPLE_WINDOW_MS) {
-        sendText("PEAK", String(alcPeak));
-        sendText("STAT", "RESULT");
-        sendText(nullptr, "");
+        float peakVoltage = (alcPeak / 4095.0f) * 3.3f;
+        gbSendLog(String("PEAK ") + alcPeak);
+        gbSendStatus("RESULT");
+        gbSendResult(alcPeak, peakVoltage);
         mode = REFRACTORY;
         modeTS = now;
         if (!HEATER_ALWAYS_ON) digitalWrite(ALC_SEL_PIN, HIGH); // heater OFF
@@ -200,8 +311,7 @@ void loop() {
 
     case REFRACTORY: {
       if (now - modeTS >= REFRACTORY_MS) {
-        sendText("STAT", "READY");
-        sendText(nullptr, "");
+        gbSendStatus("READY");
         mode = IDLE;
       }
       break;
