@@ -44,6 +44,19 @@ static bool gbConnected = false;
 static bool gbNotifyEnabled = false;
 static uint16_t gbNotifyMax = 20;
 
+// ===== State machine =====
+enum Mode { IDLE, WARMING, SAMPLING, REFRACTORY } mode = IDLE;
+
+float baselinePa = NAN;
+float lpAlpha = 0.0f;           // EMA coefficient
+uint32_t lastSampleMS = 0;
+
+uint16_t trigHoldMS = 0;
+uint32_t modeTS = 0;
+
+int   alcRaw  = 0, alcPeak = 0;
+float lastDeltaHPA = 0.0f;
+
 void gbSendStatus(const String &msg);
 void gbSendLog(const String &msg);
 void gbSendResult(int peakRaw, float peakVoltage);
@@ -167,19 +180,6 @@ void gbSendInitialBurst() {
   gbSendLog(String("ALC ") + alcRaw + " (" + String(v, 2) + " V)");
   gbSendLog(String("PEAK ") + alcPeak);
 }
-
-// ===== State machine =====
-enum Mode { IDLE, WARMING, SAMPLING, REFRACTORY } mode = IDLE;
-
-float baselinePa = NAN;
-float lpAlpha = 0.0f;           // EMA coefficient
-uint32_t lastSampleMS = 0;
-
-uint16_t trigHoldMS = 0;
-uint32_t modeTS = 0;
-
-int   alcRaw  = 0, alcPeak = 0;
-float lastDeltaHPA = 0.0f;
 
 void setup() {
   Serial.begin(115200);
