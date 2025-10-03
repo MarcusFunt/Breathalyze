@@ -72,11 +72,13 @@ class GBServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server) override {
     gbConnected = true;
     gbNotifyEnabled = false;
+    gbNotifyMax = 20;
     gbSendStatus(gbCurrentStatusMessage());
   }
   void onDisconnect(NimBLEServer* server) override {
     gbConnected = false;
     gbNotifyEnabled = false;
+    gbNotifyMax = 20;
     NimBLEDevice::startAdvertising();
   }
   void onMTUChange(uint16_t MTU, ble_gap_conn_desc* desc) override {
