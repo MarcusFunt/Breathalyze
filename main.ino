@@ -70,19 +70,25 @@ static const NimBLEUUID GB_CHAR_UUID_RX("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
 static const NimBLEUUID GB_CHAR_UUID_TX("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
 
 class GBServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* server) override {
+  void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
+    (void)server;
+    (void)connInfo;
     gbConnected = true;
     gbNotifyEnabled = false;
     gbNotifyMax = 20;
     gbSendStatus(gbCurrentStatusMessage());
   }
-  void onDisconnect(NimBLEServer* server) override {
+  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
+    (void)server;
+    (void)connInfo;
+    (void)reason;
     gbConnected = false;
     gbNotifyEnabled = false;
     gbNotifyMax = 20;
     NimBLEDevice::startAdvertising();
   }
-  void onMTUChange(uint16_t MTU, ble_gap_conn_desc* desc) override {
+  void onMTUChange(uint16_t MTU, NimBLEConnInfo& connInfo) override {
+    (void)connInfo;
     int adjusted = static_cast<int>(MTU) - 3;
     if (adjusted < 20) adjusted = 20;
     gbNotifyMax = static_cast<uint16_t>(adjusted);
@@ -90,7 +96,8 @@ class GBServerCallbacks : public NimBLEServerCallbacks {
 };
 
 class GBRxCallbacks : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* characteristic) override {
+  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& connInfo) override {
+    (void)connInfo;
     // Gadgetbridge may send "v" (version) or other commands. We do not
     // currently act on them, but reading and ignoring prevents warnings.
     std::string value = characteristic->getValue();
@@ -100,8 +107,10 @@ class GBRxCallbacks : public NimBLECharacteristicCallbacks {
 
 class GBTxCallbacks : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic* characteristic,
-                   ble_gap_conn_desc* desc,
+                   NimBLEConnInfo& connInfo,
                    uint16_t subValue) override {
+    (void)characteristic;
+    (void)connInfo;
     bool enabled = (subValue & 0x0001);
     gbNotifyEnabled = enabled;
     if (enabled) {
@@ -142,11 +151,8 @@ void gbSendJSON(const String &json) {
   size_t totalLen = payload.length();
   for (size_t offset = 0; offset < totalLen; offset += gbNotifyMax) {
     size_t chunkLen = std::min<size_t>(gbNotifyMax, totalLen - offset);
-    if (!gbTxCharacteristic->setValue(reinterpret_cast<const uint8_t*>(data + offset),
-                                      chunkLen)) {
-      Serial.println("GB notify setValue failed");
-      return;
-    }
+    gbTxCharacteristic->setValue(reinterpret_cast<const uint8_t*>(data + offset),
+                                 chunkLen);
     if (!gbTxCharacteristic->notify()) {
       Serial.println("GB notify failed");
       return;
@@ -233,7 +239,7 @@ void setup() {
 
   // --- Gadgetbridge BLE ---
   NimBLEDevice::init("Breathalyze");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P7);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEServer* server = NimBLEDevice::createServer();
   server->setCallbacks(new GBServerCallbacks());
 
@@ -253,7 +259,9 @@ void setup() {
 
   NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
   advertising->addServiceUUID(GB_SERVICE_UUID);
-  advertising->setScanResponse(true);
+  NimBLEAdvertisementData scanResponseData;
+  scanResponseData.setName("Breathalyze");
+  advertising->setScanResponseData(scanResponseData);
   advertising->setMinInterval(100);
   advertising->setMaxInterval(200);
   NimBLEDevice::startAdvertising();
